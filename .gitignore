@@ -1,0 +1,31 @@
+# Build outputs
+*.exe
+*.obj
+*.o
+*.pdb
+
+# Model artifacts
+*.bin
+*.wlm
+
+# Large generated corpora and logs
+big_corpus.txt
+*_clean.txt
+corpus_build.log
+
+# Generated directories
+corpus_work/
+corpus_test/
+scale_run/
+scale_run2/
+major_lab_run/
+
+# Shard and checkpoint artifacts
+**/shards/
+**/shard_models/
+checkpoint_cycle_*.bin
+
+# OS / editor
+.vscode/
+.DS_Store
+Thumbs.db
