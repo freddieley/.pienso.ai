@@ -1,0 +1,8 @@
+C:\Users\Fredd\OneDrive\.pienso.ai\corpus_work\gutenberg_w00.txt
+C:\Users\Fredd\OneDrive\.pienso.ai\corpus_work\gutenberg_w01.txt
+C:\Users\Fredd\OneDrive\.pienso.ai\corpus_work\gutenberg_w02.txt
+C:\Users\Fredd\OneDrive\.pienso.ai\corpus_work\gutenberg_w03.txt
+C:\Users\Fredd\OneDrive\.pienso.ai\corpus_work\gutenberg_w04.txt
+C:\Users\Fredd\OneDrive\.pienso.ai\corpus_work\gutenberg_w05.txt
+C:\Users\Fredd\OneDrive\.pienso.ai\corpus_work\gutenberg_w06.txt
+C:\Users\Fredd\OneDrive\.pienso.ai\corpus_work\gutenberg_w07.txt

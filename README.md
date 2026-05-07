@@ -55,6 +55,13 @@ gcc -O2 -o eval_metrics.exe eval_metrics.c
 .\word_lm.exe gen-sample word_model.wlm "machine learning" 64 1 123
 ```
 
+### 5) Fast adaptation mode (instant correction)
+```powershell
+.\\full_lm.exe patch-add quick_patches.txt "machine learning" " is solved by fast patch memory."
+.\\full_lm.exe patch-stats quick_patches.txt
+.\\full_lm.exe gen-fast scale_run\\model_merged.bin quick_patches.txt "machine learning" 80 220 ?
+```
+
 ## Notes on Artifacts
 Model binaries, checkpoints, corpora, and executables are intentionally git-ignored. Keep source, scripts, and docs in Git; keep large artifacts local or publish them as release assets.
 

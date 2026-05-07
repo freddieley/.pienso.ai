@@ -10,6 +10,8 @@
 #define CONF_SMOOTH 4U
 #define CONF_ENOUGH 0xB000U
 #define MAGIC 0x314D4C4EU /* NLM1 */
+#define PATCH_PROMPT_MAX 512U
+#define PATCH_RESP_MAX   2048U
 
 typedef struct {
     uint32_t magic;
@@ -87,6 +89,85 @@ static inline uint32_t lxor_upd(uint32_t acc, uint8_t tok) {
 
 static inline uint32_t conf_score(uint32_t best, uint32_t total) {
     return (best << 16) / (total + CONF_SMOOTH);
+}
+
+static void normalize_text(const char *in, char *out, size_t out_cap) {
+    size_t j = 0;
+    int prev_space = 1;
+    if (out_cap == 0) return;
+    while (*in && j + 1 < out_cap) {
+        unsigned char c = (unsigned char)*in++;
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32U);
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+        if (c == ' ') {
+            if (!prev_space) out[j++] = ' ';
+            prev_space = 1;
+        } else {
+            out[j++] = (char)c;
+            prev_space = 0;
+        }
+    }
+    while (j > 0 && out[j - 1] == ' ') j--;
+    out[j] = '\0';
+}
+
+static int patch_find_response(const char *patch_path, const char *prompt, char *resp_out, size_t resp_cap) {
+    FILE *f;
+    char line[PATCH_PROMPT_MAX + PATCH_RESP_MAX + 16];
+    char key[PATCH_PROMPT_MAX];
+    normalize_text(prompt, key, sizeof(key));
+
+    f = fopen(patch_path, "rb");
+    if (!f) return 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        char *tab;
+        size_t n;
+        char pnorm[PATCH_PROMPT_MAX];
+
+        if (line[0] == '#') continue;
+        n = strlen(line);
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+        if (n == 0) continue;
+
+        tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab++ = '\0';
+
+        normalize_text(line, pnorm, sizeof(pnorm));
+        if (strcmp(pnorm, key) == 0) {
+            strncpy(resp_out, tab, resp_cap - 1);
+            resp_out[resp_cap - 1] = '\0';
+            fclose(f);
+            return 1;
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+static int patch_append(const char *patch_path, const char *prompt, const char *resp) {
+    FILE *f = fopen(patch_path, "ab");
+    char pnorm[PATCH_PROMPT_MAX];
+    if (!f) return 0;
+    normalize_text(prompt, pnorm, sizeof(pnorm));
+    fprintf(f, "%s\t%s\n", pnorm, resp);
+    fclose(f);
+    return 1;
+}
+
+static uint32_t patch_count(const char *patch_path) {
+    FILE *f = fopen(patch_path, "rb");
+    char line[PATCH_PROMPT_MAX + PATCH_RESP_MAX + 16];
+    uint32_t c = 0U;
+    if (!f) return 0U;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        c++;
+    }
+    fclose(f);
+    return c;
 }
 
 #define BG(lm,a,b) ((lm)->bigram[(uint32_t)(a)*VOCAB_SIZE + (uint32_t)(b)])
@@ -463,6 +544,31 @@ static void lm_emit_ex(fused_lm_t *lm, uint32_t max_len, uint32_t temp_shift, ui
     fputs(out, stdout);
 }
 
+static void lm_emit_gated(fused_lm_t *lm, uint32_t max_len, uint8_t min_conf, uint8_t abstain_tok) {
+    char out[4096];
+    uint32_t len = 0;
+
+    while (len + 1U < sizeof(out) && len < max_len) {
+        uint8_t conf = 0U;
+        uint8_t tok = lm_predict(lm, &conf);
+
+        if (conf < min_conf) {
+            out[len++] = (char)abstain_tok;
+            break;
+        }
+        if (tok < 9U || (tok > 13U && tok < 32U)) tok = (uint8_t)' ';
+
+        out[len++] = (char)tok;
+        lm->lxor = lxor_upd(lm->lxor, tok);
+        push_ctx(lm, tok);
+
+        if ((tok == '.' || tok == '!' || tok == '?') && len > 40U) break;
+        if (tok == '\n' && len > 24U) break;
+    }
+    out[len] = '\0';
+    fputs(out, stdout);
+}
+
 static void lm_emit_with_guard(fused_lm_t *lm, uint32_t max_len) {
     lm_emit_ex(lm, max_len, 0U, 0U);
 }
@@ -695,12 +801,67 @@ static void usage(const char *exe) {
     printf("  %s eval-list <model.bin> <files.txt> [online=0]\n", exe);
     printf("  %s gen   <model.bin> <prompt> [max_len=256]\n", exe);
     printf("  %s gen-sample <model.bin> <prompt> [max_len=256] [temp=1] [seed=0]\n", exe);
+    printf("  %s gen-fast <model.bin> <patch.txt> <prompt> [max_len=256] [min_conf=160] [abstain=?]\n", exe);
+    printf("  %s patch-add <patch.txt> <prompt> <response>\n", exe);
+    printf("  %s patch-stats <patch.txt>\n", exe);
     printf("  %s chat  <model.bin>\n", exe);
     printf("  %s merge <base.bin> <shard.bin> [shard2.bin ...] <out.bin>\n", exe);
     printf("\nDefaults: passes=8 slots=16 ctx_count=32768\n");
     printf("\nfiles.txt format: one corpus file path per line, '#' for comments.\n");
     printf("merge: combines table counts from shard models into base model (data-parallel)\n");
     printf("gen-sample temp: 0=greedy 1=count-weighted 2=count^2-weighted (no floats)\n");
+    printf("gen-fast: checks patch memory first, then confidence-gated generation\n");
+}
+
+static int cmd_patch_add(int argc, char **argv) {
+    const char *patch_path = argv[2];
+    const char *prompt = argv[3];
+    const char *response = argv[4];
+    if (!patch_append(patch_path, prompt, response)) {
+        fprintf(stderr, "Failed to append patch: %s\n", patch_path);
+        return 1;
+    }
+    printf("patch-added: %s\n", patch_path);
+    return 0;
+}
+
+static int cmd_patch_stats(int argc, char **argv) {
+    const char *patch_path = argv[2];
+    uint32_t n = patch_count(patch_path);
+    printf("patch-file: %s\n", patch_path);
+    printf("entries: %u\n", n);
+    return 0;
+}
+
+static int cmd_gen_fast(int argc, char **argv) {
+    const char *model_path = argv[2];
+    const char *patch_path = argv[3];
+    const char *prompt = argv[4];
+    uint32_t max_len = (argc > 5) ? (uint32_t)strtoul(argv[5], NULL, 10) : 256U;
+    uint32_t min_conf_u = (argc > 6) ? (uint32_t)strtoul(argv[6], NULL, 10) : 160U;
+    uint8_t min_conf = (uint8_t)(min_conf_u > 255U ? 255U : min_conf_u);
+    uint8_t abstain = (argc > 7 && argv[7][0] != '\0') ? (uint8_t)argv[7][0] : (uint8_t)'?';
+    char resp[PATCH_RESP_MAX];
+    fused_lm_t lm;
+
+    if (patch_find_response(patch_path, prompt, resp, sizeof(resp))) {
+        printf("%s%s\n", prompt, resp);
+        return 0;
+    }
+
+    if (!load_model(&lm, model_path)) {
+        fprintf(stderr, "Failed to load model: %s\n", model_path);
+        return 1;
+    }
+
+    lm_reset_context(&lm);
+    lm_prime_ctx(&lm, (const uint8_t *)prompt, (uint32_t)strlen(prompt));
+    printf("%s", prompt);
+    lm_emit_gated(&lm, max_len, min_conf, abstain);
+    putchar('\n');
+
+    free_tables(&lm);
+    return 0;
 }
 
 static int cmd_train(int argc, char **argv) {
@@ -1145,6 +1306,18 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "gen-sample") == 0) {
         if (argc < 4) { usage(argv[0]); return 1; }
         return cmd_gen_sample(argc, argv);
+    }
+    if (strcmp(argv[1], "gen-fast") == 0) {
+        if (argc < 5) { usage(argv[0]); return 1; }
+        return cmd_gen_fast(argc, argv);
+    }
+    if (strcmp(argv[1], "patch-add") == 0) {
+        if (argc < 5) { usage(argv[0]); return 1; }
+        return cmd_patch_add(argc, argv);
+    }
+    if (strcmp(argv[1], "patch-stats") == 0) {
+        if (argc < 3) { usage(argv[0]); return 1; }
+        return cmd_patch_stats(argc, argv);
     }
     if (strcmp(argv[1], "chat") == 0) {
         if (argc < 3) { usage(argv[0]); return 1; }
