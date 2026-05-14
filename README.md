@@ -62,6 +62,13 @@ gcc -O2 -o eval_metrics.exe eval_metrics.c
 .\\full_lm.exe gen-fast scale_run\\model_merged.bin quick_patches.txt "machine learning" 80 220 ?
 ```
 
+### 6) Nested learning experiment
+```powershell
+.\\full_lm.exe eval-nested tiny_nested.bin tiny_test.txt 256
+.\\full_lm.exe gen-nested tiny_nested.bin "nested learning" 80 123
+```
+Nested mode keeps the base model frozen and lets a fast inner learner adapt online within a stream or file window. That makes it a good fit for testing rapid adaptation with very little data.
+
 ## Notes on Artifacts
 Model binaries, checkpoints, corpora, and executables are intentionally git-ignored. Keep source, scripts, and docs in Git; keep large artifacts local or publish them as release assets.
 

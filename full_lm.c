@@ -579,6 +579,125 @@ static void lm_reset_context(fused_lm_t *lm) {
     lm->lxor = 0U;
 }
 
+static uint8_t nested_choose_token(const fused_lm_t *outer, const fused_lm_t *inner,
+                                   uint8_t *conf_out, uint8_t *inner_conf_out) {
+    uint8_t outer_conf = 0U;
+    uint8_t inner_conf = 0U;
+    uint8_t outer_tok = lm_predict(outer, &outer_conf);
+    uint8_t inner_tok = lm_predict(inner, &inner_conf);
+
+    if (inner_conf >= CONF_ENOUGH || inner_conf >= outer_conf) {
+        if (conf_out) *conf_out = inner_conf;
+        if (inner_conf_out) *inner_conf_out = inner_conf;
+        return inner_tok;
+    }
+
+    if (conf_out) *conf_out = outer_conf;
+    if (inner_conf_out) *inner_conf_out = inner_conf;
+    return outer_tok;
+}
+
+static int eval_nested_stream_file(fused_lm_t *outer, fused_lm_t *inner, const char *path,
+                                   uint32_t window, uint64_t *correct_out, uint64_t *n_out) {
+    FILE *f = fopen(path, "rb");
+    unsigned char chunk[1U << 20];
+    uint32_t seen = 0U;
+
+    if (!f) return 0;
+
+    lm_reset_context(inner);
+    for (;;) {
+        size_t got = fread(chunk, 1, sizeof(chunk), f);
+        if (got == 0) break;
+        for (size_t i = 0; i < got; ++i) {
+            uint8_t conf = 0U, inner_conf = 0U;
+            uint8_t pred;
+
+            if (window && seen >= window) {
+                lm_reset_context(inner);
+                seen = 0U;
+            }
+
+            pred = nested_choose_token(outer, inner, &conf, &inner_conf);
+            if (pred == chunk[i]) (*correct_out)++;
+            (*n_out)++;
+
+            /* inner learner adapts on the live stream; outer stays fixed */
+            lm_update(inner, chunk[i]);
+            seen++;
+        }
+    }
+
+    fclose(f);
+    return 1;
+}
+
+static int eval_nested_stream_list(fused_lm_t *outer, fused_lm_t *inner, const char *list_path,
+                                   uint32_t window, uint64_t *correct_out, uint64_t *n_out,
+                                   uint32_t *files_out) {
+    FILE *listf = fopen(list_path, "rb");
+    char line[2048];
+
+    if (!listf) return 0;
+
+    while (fgets(line, sizeof(line), listf)) {
+        char *cur = line;
+        size_t n;
+
+        if ((unsigned char)cur[0] == 0xEFU && (unsigned char)cur[1] == 0xBBU && (unsigned char)cur[2] == 0xBFU) {
+            cur += 3;
+        }
+
+        n = strlen(cur);
+        while (n > 0 && (cur[n - 1] == '\n' || cur[n - 1] == '\r' || cur[n - 1] == ' ' || cur[n - 1] == '\t')) {
+            cur[--n] = '\0';
+        }
+        if (n == 0 || cur[0] == '#') continue;
+
+        if (!eval_nested_stream_file(outer, inner, cur, window, correct_out, n_out)) {
+            fprintf(stderr, "warn: could not eval nested %s\n", cur);
+            continue;
+        }
+        (*files_out)++;
+    }
+
+    fclose(listf);
+    return 1;
+}
+
+static void emit_nested(fused_lm_t *outer, fused_lm_t *inner, uint32_t max_len, uint32_t seed) {
+    char out[4096];
+    uint32_t len = 0U;
+    uint32_t rng = seed ? seed : 0xC0FFEEU;
+    uint8_t prev = 0U;
+    uint8_t run = 0U;
+
+    while (len + 1U < sizeof(out) && len < max_len) {
+        uint8_t conf = 0U;
+        uint8_t inner_conf = 0U;
+        uint8_t tok = nested_choose_token(outer, inner, &conf, &inner_conf);
+
+        if (tok == 0U) tok = (uint8_t)' ';
+        if (tok == prev) run++; else run = 0U;
+        prev = tok;
+
+        if (run > 6U) {
+            uint32_t x = rng; x ^= x << 13; x ^= x >> 17; x ^= x << 5; rng = x;
+            tok = (uint8_t)(32U + x % 64U);
+            run = 0U;
+        }
+
+        out[len++] = (char)tok;
+        lm_update(inner, tok);
+
+        if (tok == '\n' && len > 24U) break;
+        if ((tok == '.' || tok == '!' || tok == '?') && len > 60U) break;
+    }
+
+    out[len] = '\0';
+    fputs(out, stdout);
+}
+
 static int read_lines_train_list(FILE *listf, fused_lm_t *lm, uint64_t *bytes_out, uint32_t *files_out) {
     char line[2048];
 
@@ -799,8 +918,11 @@ static void usage(const char *exe) {
     printf("  %s resume-list <model.bin> <files.txt> [passes]\n", exe);
     printf("  %s eval  <model.bin> <test.txt> [online=1]\n", exe);
     printf("  %s eval-list <model.bin> <files.txt> [online=0]\n", exe);
+    printf("  %s eval-nested <model.bin> <test.txt> [window=4096]\n", exe);
+    printf("  %s eval-nested-list <model.bin> <files.txt> [window=4096]\n", exe);
     printf("  %s gen   <model.bin> <prompt> [max_len=256]\n", exe);
     printf("  %s gen-sample <model.bin> <prompt> [max_len=256] [temp=1] [seed=0]\n", exe);
+    printf("  %s gen-nested <model.bin> <prompt> [max_len=256] [seed=0]\n", exe);
     printf("  %s gen-fast <model.bin> <patch.txt> <prompt> [max_len=256] [min_conf=160] [abstain=?]\n", exe);
     printf("  %s patch-add <patch.txt> <prompt> <response>\n", exe);
     printf("  %s patch-stats <patch.txt>\n", exe);
@@ -811,6 +933,136 @@ static void usage(const char *exe) {
     printf("merge: combines table counts from shard models into base model (data-parallel)\n");
     printf("gen-sample temp: 0=greedy 1=count-weighted 2=count^2-weighted (no floats)\n");
     printf("gen-fast: checks patch memory first, then confidence-gated generation\n");
+    printf("nested: inner learner adapts online while outer model stays frozen\n");
+}
+
+static int cmd_eval_nested(int argc, char **argv) {
+    const char *model_path = argv[2];
+    const char *test_path = argv[3];
+    uint32_t window = (argc > 4) ? (uint32_t)strtoul(argv[4], NULL, 10) : 4096U;
+
+    fused_lm_t outer;
+    fused_lm_t inner;
+    uint64_t correct = 0;
+    uint64_t n = 0;
+    clock_t t0, t1;
+
+    if (!load_model(&outer, model_path)) {
+        fprintf(stderr, "Failed to load model: %s\n", model_path);
+        return 1;
+    }
+    if (!alloc_tables(&inner, outer.slots, outer.ctx_count)) {
+        fprintf(stderr, "Failed to allocate nested learner tables.\n");
+        free_tables(&outer);
+        return 1;
+    }
+
+    t0 = clock();
+    if (!eval_nested_stream_file(&outer, &inner, test_path, window, &correct, &n)) {
+        fprintf(stderr, "Failed to load test file: %s\n", test_path);
+        free_tables(&inner);
+        free_tables(&outer);
+        return 1;
+    }
+    t1 = clock();
+
+    {
+        double elapsed = (double)(t1 - t0) / CLOCKS_PER_SEC;
+        if (elapsed <= 0.0) elapsed = 1.0 / CLOCKS_PER_SEC;
+
+        printf("eval_nested_file: %s\n", test_path);
+        printf("window: %u\n", window);
+        printf("tokens: %llu\n", (unsigned long long)n);
+        printf("accuracy: %.2f%%\n", n ? (100.0 * (double)correct / (double)n) : 0.0);
+        printf("mode: frozen-outer + online-inner\n");
+        printf("speed: %.2f Mtok/s\n", n ? ((double)n / elapsed) / 1e6 : 0.0);
+    }
+
+    free_tables(&inner);
+    free_tables(&outer);
+    return 0;
+}
+
+static int cmd_eval_nested_list(int argc, char **argv) {
+    const char *model_path = argv[2];
+    const char *list_path = argv[3];
+    uint32_t window = (argc > 4) ? (uint32_t)strtoul(argv[4], NULL, 10) : 4096U;
+
+    fused_lm_t outer;
+    fused_lm_t inner;
+    uint64_t correct = 0;
+    uint64_t n = 0;
+    uint32_t files = 0;
+    clock_t t0, t1;
+
+    if (!load_model(&outer, model_path)) {
+        fprintf(stderr, "Failed to load model: %s\n", model_path);
+        return 1;
+    }
+    if (!alloc_tables(&inner, outer.slots, outer.ctx_count)) {
+        fprintf(stderr, "Failed to allocate nested learner tables.\n");
+        free_tables(&outer);
+        return 1;
+    }
+
+    t0 = clock();
+    if (!eval_nested_stream_list(&outer, &inner, list_path, window, &correct, &n, &files)) {
+        fprintf(stderr, "Failed to load eval list: %s\n", list_path);
+        free_tables(&inner);
+        free_tables(&outer);
+        return 1;
+    }
+    t1 = clock();
+
+    {
+        double elapsed = (double)(t1 - t0) / CLOCKS_PER_SEC;
+        if (elapsed <= 0.0) elapsed = 1.0 / CLOCKS_PER_SEC;
+
+        printf("eval_nested_list: %s\n", list_path);
+        printf("files: %u\n", files);
+        printf("window: %u\n", window);
+        printf("tokens: %llu\n", (unsigned long long)n);
+        printf("accuracy: %.2f%%\n", n ? (100.0 * (double)correct / (double)n) : 0.0);
+        printf("mode: frozen-outer + online-inner\n");
+        printf("speed: %.2f Mtok/s\n", n ? ((double)n / elapsed) / 1e6 : 0.0);
+    }
+
+    free_tables(&inner);
+    free_tables(&outer);
+    return 0;
+}
+
+static int cmd_gen_nested(int argc, char **argv) {
+    const char *model_path = argv[2];
+    const char *prompt = argv[3];
+    uint32_t max_len = (argc > 4) ? (uint32_t)strtoul(argv[4], NULL, 10) : 256U;
+    uint32_t seed = (argc > 5) ? (uint32_t)strtoul(argv[5], NULL, 10) : (uint32_t)time(NULL);
+
+    fused_lm_t outer;
+    fused_lm_t inner;
+
+    if (!load_model(&outer, model_path)) {
+        fprintf(stderr, "Failed to load model: %s\n", model_path);
+        return 1;
+    }
+    if (!alloc_tables(&inner, outer.slots, outer.ctx_count)) {
+        fprintf(stderr, "Failed to allocate nested learner tables.\n");
+        free_tables(&outer);
+        return 1;
+    }
+
+    lm_reset_context(&outer);
+    lm_reset_context(&inner);
+    lm_prime_ctx(&outer, (const uint8_t *)prompt, (uint32_t)strlen(prompt));
+    lm_prime_ctx(&inner, (const uint8_t *)prompt, (uint32_t)strlen(prompt));
+
+    printf("%s", prompt);
+    emit_nested(&outer, &inner, max_len, seed);
+    putchar('\n');
+
+    free_tables(&inner);
+    free_tables(&outer);
+    return 0;
 }
 
 static int cmd_patch_add(int argc, char **argv) {
@@ -1299,6 +1551,14 @@ int main(int argc, char **argv) {
         if (argc < 4) { usage(argv[0]); return 1; }
         return cmd_eval_list(argc, argv);
     }
+    if (strcmp(argv[1], "eval-nested") == 0) {
+        if (argc < 4) { usage(argv[0]); return 1; }
+        return cmd_eval_nested(argc, argv);
+    }
+    if (strcmp(argv[1], "eval-nested-list") == 0) {
+        if (argc < 4) { usage(argv[0]); return 1; }
+        return cmd_eval_nested_list(argc, argv);
+    }
     if (strcmp(argv[1], "gen") == 0) {
         if (argc < 4) { usage(argv[0]); return 1; }
         return cmd_gen(argc, argv);
@@ -1306,6 +1566,10 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "gen-sample") == 0) {
         if (argc < 4) { usage(argv[0]); return 1; }
         return cmd_gen_sample(argc, argv);
+    }
+    if (strcmp(argv[1], "gen-nested") == 0) {
+        if (argc < 4) { usage(argv[0]); return 1; }
+        return cmd_gen_nested(argc, argv);
     }
     if (strcmp(argv[1], "gen-fast") == 0) {
         if (argc < 5) { usage(argv[0]); return 1; }

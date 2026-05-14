@@ -19,6 +19,7 @@ corpus_test/
 scale_run/
 scale_run2/
 major_lab_run/
+nested_learning_system/
 
 # Shard and checkpoint artifacts
 **/shards/

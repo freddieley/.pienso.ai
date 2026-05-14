@@ -29,3 +29,18 @@ full_lm.exe gen-fast smoke.bin quick_patches.txt "machine learning" 80 220 ?
 ## Batch evaluation
 
 Use eval_fast_adapt.ps1 with a tab-separated file prompt<TAB>expected_suffix.
+
+## Nested learning experiment
+
+The nested-learning path in full_lm.exe uses a frozen outer model plus a fast online inner learner.
+
+Commands:
+
+- eval-nested <model.bin> <test.txt> [window=4096]
+- eval-nested-list <model.bin> <files.txt> [window=4096]
+- gen-nested <model.bin> <prompt> [max_len=256] [seed=0]
+
+Observed smoke-test result on a tiny stream:
+
+- frozen base accuracy: 13.11%
+- nested online-inner accuracy: 61.48%
