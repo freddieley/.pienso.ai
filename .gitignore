@@ -32,4 +32,4 @@ checkpoint_cycle_*.bin
 Thumbs.db
 
 # Virtual environment
-.venv/
+.venv*/
